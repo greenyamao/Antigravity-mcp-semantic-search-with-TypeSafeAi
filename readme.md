@@ -75,15 +75,25 @@ Add the server to your global MCP configuration:
 ```
 *Note: Use forward slashes (`/`) in file paths. The `alwaysAllow` array allows seamless execution without manual approval prompts.*
 
-### 5. Agent Rules
-Add the following to `AGENTS.md` in any workspace root to instruct your AI assistant:
+### 5. Add Skill & Rules to Your Project
+To make the AI assistant use this MCP server, copy the bundled skill and rules into your target project:
 
-```markdown
-# TypeSafe Code Guard Rules
-- **Semantic Code Search**: Always call `typesafe_find_code` with a behavioral description (what the code *does*, not literal keywords) before grepping or reading multiple files.
-- **Diff Sanity Check**: Call `typesafe_audit_diff` before finishing edits to verify scope alignment and catch removed defensive checks or leftover debug statements.
-- For query formulation examples and metric thresholds, activate the `typesafe-code-guard` skill.
-```
+1. **Copy the Skill**:
+   ```bash
+   # Windows (PowerShell)
+   Copy-Item -Recurse .agents\skills\typesafe-code-guard \path\to\your-project\.agents\skills\
+
+   # macOS / Linux
+   cp -r .agents/skills/typesafe-code-guard /path/to/your-project/.agents/skills/
+   ```
+
+2. **Copy the Rules**:
+   Copy `AGENTS.md` to your target project root (or append its contents to your existing `AGENTS.md`):
+   ```bash
+   cp AGENTS.md /path/to/your-project/
+   ```
+
+*(Alternative: copy them to `$HOME/.gemini/config/skills/` and `$HOME/.gemini/config/rules/` to enable them globally for all projects).*
 
 ---
 
