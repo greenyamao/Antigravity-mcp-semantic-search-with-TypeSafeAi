@@ -181,6 +181,22 @@ def _gather_files(
     return candidates
 
 
+def _format_typesafe_error(err: Exception) -> str:
+    """Format TypeSafe SDK exceptions into clear, actionable advice for the agent."""
+    err_str = str(err)
+    err_name = type(err).__name__
+
+    if "AuthenticationError" in err_name or "401" in err_str:
+        return "❌ TypeSafe Authentication Failed: Invalid or expired TYPESAFE_API_KEY. Please verify your key at https://console.typesafe.ai/settings/keys"
+    if "RateLimitError" in err_name or "429" in err_str:
+        return "⚠️ TypeSafe Rate Limit Exceeded: Too many requests. Please wait a few seconds before retrying."
+    if "ConnectionError" in err_name:
+        return f"🌐 TypeSafe Connection Error: Unable to reach https://api.typesafe.ai. Check your network or proxy settings ({err_str})."
+    if "Timeout" in err_name:
+        return "⏱️ TypeSafe Request Timeout: The server did not respond in time. Please retry."
+    return f"❌ TypeSafe API Error: {err_str}"
+
+
 @mcp.tool()
 def typesafe_find_code(
     query: str,
@@ -198,87 +214,139 @@ def typesafe_find_code(
         directory: Target directory to search in (defaults to current working directory).
         file_extensions: Optional list of file extensions to filter (e.g. ['.py', '.ts']).
     """
+    clean_query = query.strip()
+    if not clean_query:
+        return "Error: Search query cannot be empty. Please provide a description of the behavior, business rule, or logic you wish to find."
+
     client, error_msg = _get_client()
     if error_msg:
         return error_msg
 
     root_path = Path(directory).resolve()
     if not root_path.exists():
-        return f"Error: Directory not found: {directory}"
-
-    candidates = _gather_files(root_path, file_extensions)
-    if not candidates:
-        return f"No matching code files found in directory: {directory}"
-
-    # If more than 25 files, prioritize by keyword relevance (filtered for stop words)
-    if len(candidates) > 25:
-        query_words = set(
-            w
-            for w in re.findall(r"\w+", query.lower())
-            if w not in STOP_WORDS and len(w) > 2
-        )
-
-        def score_candidate(item: Tuple[str, str]) -> int:
-            rel_path, summary = item
-            rel_lower = rel_path.lower()
-            summary_lower = summary.lower()
-            path_score = sum(3 for w in query_words if w in rel_lower)
-            summary_score = sum(1 for w in query_words if w in summary_lower)
-            return path_score + summary_score
-
-        candidates = sorted(candidates, key=score_candidate, reverse=True)[:25]
-
-    # Stage 1: Coarse file selection
-    file_options = {
-        f"F{i:02d}": f"{path}: {summary}"
-        for i, (path, summary) in enumerate(candidates)
-    }
+        return f"Error: Directory does not exist: '{directory}' (resolved: {root_path})"
+    if not root_path.is_dir():
+        return f"Error: Path is not a directory: '{directory}'"
 
     try:
-        stage1_resp = client.system_one(
-            state={"query": query, "candidate_files": file_options},
-            questions={
-                "best_file": Choice(
-                    instructions=f"Which file is most likely to contain or implement the following logic: '{query}'?",
-                    criteria={k: None for k in file_options},
-                ),
-                "has_answer": Noul(
-                    instructions=f"Does any of the candidate files likely contain or relate to: '{query}'?",
-                    criteria=NoulCriteria(
-                        true="At least one candidate file addresses or relates to the query",
-                        false="None of these candidate files contain relevant logic",
-                    ),
-                ),
-            },
-        )
+        candidates = _gather_files(root_path, file_extensions)
+    except PermissionError:
+        return f"Error: Permission denied reading directory: '{directory}'"
     except Exception as err:
-        return f"TypeSafe API error during file selection: {err}"
+        return f"Error scanning directory '{directory}': {err}"
 
-    best_file_key = stage1_resp.answers["best_file"].choice
-    has_answer_prob = stage1_resp.answers["has_answer"].noul
-    file_confidence = stage1_resp.answers["best_file"].confidence
+    # Edge Case: Project is empty or contains no recognized code files
+    if not candidates:
+        ext_msg = f" matching extensions {file_extensions}" if file_extensions else ""
+        return (
+            f"ℹ️ Project is empty or contains no code files in '{directory}'{ext_msg}.\n"
+            f"- Checked path: `{root_path}`\n"
+            "- If this is a newly created workspace, create or add project code files before searching."
+        )
 
-    if has_answer_prob < 0.25 and file_confidence < 0.25:
-        return f"No relevant file found for query: '{query}' (Relevance: {has_answer_prob:.2f})."
+    # Edge Case & Optimization: Project has only 1 file — skip Stage 1 entirely!
+    if len(candidates) == 1:
+        winner_rel_path = candidates[0][0]
+        winner_abs_path = root_path / winner_rel_path
+        file_confidence = 1.0
+        has_answer_prob = 1.0
+    else:
+        # If more than 25 files, prioritize by keyword relevance (filtered for stop words)
+        if len(candidates) > 25:
+            query_words = set(
+                w
+                for w in re.findall(r"\w+", clean_query.lower())
+                if w not in STOP_WORDS and len(w) > 2
+            )
 
-    # Resolve winning file
-    file_idx = int(best_file_key[1:])
-    winner_rel_path = candidates[file_idx][0]
-    winner_abs_path = root_path / winner_rel_path
+            def score_candidate(item: Tuple[str, str]) -> int:
+                rel_path, summary = item
+                rel_lower = rel_path.lower()
+                summary_lower = summary.lower()
+                path_score = sum(3 for w in query_words if w in rel_lower)
+                summary_score = sum(1 for w in query_words if w in summary_lower)
+                return path_score + summary_score
 
+            candidates = sorted(candidates, key=score_candidate, reverse=True)[:25]
+
+        # Stage 1: Coarse file selection
+        file_options = {
+            f"F{i:02d}": f"{path}: {summary}"
+            for i, (path, summary) in enumerate(candidates)
+        }
+
+        try:
+            stage1_resp = client.system_one(
+                state={"query": clean_query, "candidate_files": file_options},
+                questions={
+                    "best_file": Choice(
+                        instructions=f"Which file is most likely to contain or implement the following logic: '{clean_query}'?",
+                        criteria={k: None for k in file_options},
+                    ),
+                    "has_answer": Noul(
+                        instructions=f"Does any of the candidate files likely contain or relate to: '{clean_query}'?",
+                        criteria=NoulCriteria(
+                            true="At least one candidate file addresses or relates to the query",
+                            false="None of these candidate files contain relevant logic",
+                        ),
+                    ),
+                },
+            )
+        except Exception as err:
+            return _format_typesafe_error(err)
+
+        best_file_key = stage1_resp.answers["best_file"].choice
+        has_answer_prob = stage1_resp.answers["has_answer"].noul
+        file_confidence = stage1_resp.answers["best_file"].confidence
+
+        if has_answer_prob < 0.25 and file_confidence < 0.25:
+            return f"No relevant file found for query: '{clean_query}' (Relevance: {has_answer_prob:.2f})."
+
+        # Resolve winning file
+        file_idx = int(best_file_key[1:])
+        winner_rel_path = candidates[file_idx][0]
+        winner_abs_path = root_path / winner_rel_path
+
+    # Read target file content
     try:
         with open(
             winner_abs_path, "r", encoding="utf-8", errors="ignore"
         ) as f:
             file_lines = f.readlines()
+    except PermissionError:
+        return f"Error: Permission denied reading file '{winner_rel_path}'"
     except Exception as err:
-        return f"Error reading target file {winner_rel_path}: {err}"
+        return f"Error reading target file '{winner_rel_path}': {err}"
 
-    if not file_lines:
-        return f"Target file `{winner_rel_path}` is empty."
+    # Edge Case: File is empty or contains only whitespace
+    if not file_lines or not any(l.strip() for l in file_lines):
+        return f"ℹ️ Target file `{winner_rel_path}` is empty (0 lines of code). Nothing to locate."
+
+    total_lines = len(file_lines)
+    file_lang = (
+        winner_abs_path.suffix.lstrip(".")
+        if winner_abs_path.suffix
+        else "plaintext"
+    )
+
+    # Edge Case & Optimization: File is very compact (<= 20 lines) — return entire file immediately!
+    if total_lines <= 20:
+        snippet_lines = [
+            f"   {idx + 1:4d} | {file_lines[idx].rstrip()}"
+            for idx in range(total_lines)
+        ]
+        return f"""### 🎯 TypeSafe Semantic Search Result
+- **Target File**: `{winner_rel_path}`
+- **Exact Line**: `1` (Range: `1 - {total_lines}`)
+- **Confidence**: `1.00` (Compact file: `{total_lines}` lines total)
+
+```{file_lang}
+{"\n".join(snippet_lines)}
+```
+
+*Note: The entire file is shown above ({total_lines} lines).*"""
 
     # Stage 2: Adaptive block-level pinpointing inside the winning file
-    total_lines = len(file_lines)
     block_size = max(15, total_lines // 25)
     blocks = []
     block_options = {}
@@ -313,17 +381,17 @@ def typesafe_find_code(
     try:
         stage2_resp = client.system_one(
             state={
-                "query": query,
+                "query": clean_query,
                 "file": winner_rel_path,
                 "code_blocks": block_options,
             },
             questions={
                 "block": Choice(
-                    instructions=f"Which code block in {winner_rel_path} implements or contains: '{query}'?",
+                    instructions=f"Which code block in {winner_rel_path} implements or contains: '{clean_query}'?",
                     criteria={k: None for k in block_options},
                 ),
                 "line_exists": Noul(
-                    instructions=f"Does any code block in this file implement or relate to: '{query}'?",
+                    instructions=f"Does any code block in this file implement or relate to: '{clean_query}'?",
                     criteria=NoulCriteria(
                         true="At least one block directly implements or relates to this logic",
                         false="The query logic is not present in this file",
@@ -332,7 +400,7 @@ def typesafe_find_code(
             },
         )
     except Exception as err:
-        return f"Found file `{winner_rel_path}`, but failed during line pinpointing: {err}"
+        return _format_typesafe_error(err)
 
     best_block_key = stage2_resp.answers["block"].choice
     line_prob = stage2_resp.answers["line_exists"].noul
@@ -348,7 +416,7 @@ def typesafe_find_code(
     # Pinpoint the best line within the winning block
     target_line_num = b_start
     query_tokens = [
-        w for w in re.findall(r"\w+", query.lower()) if w not in STOP_WORDS
+        w for w in re.findall(r"\w+", clean_query.lower()) if w not in STOP_WORDS
     ]
 
     for offset, line in enumerate(chunk_lines):
@@ -374,12 +442,6 @@ def typesafe_find_code(
             f"{line_prefix}{idx + 1:4d} | {file_lines[idx].rstrip()}"
         )
     snippet = "\n".join(snippet_lines)
-
-    file_lang = (
-        winner_abs_path.suffix.lstrip(".")
-        if winner_abs_path.suffix
-        else "plaintext"
-    )
 
     return f"""### 🎯 TypeSafe Semantic Search Result
 - **Target File**: `{winner_rel_path}`
@@ -440,13 +502,23 @@ def typesafe_audit_diff(
         git_diff: The git diff content. If omitted, automatically runs `git diff HEAD`.
         directory: The repository root directory (defaults to current working directory).
     """
+    clean_task = task_description.strip()
+    if not clean_task:
+        return "Error: task_description cannot be empty. Please provide the requested task or intent to audit the diff against."
+
     client, error_msg = _get_client()
     if error_msg:
         return error_msg
 
     diff_text = git_diff.strip()
+    repo_dir = Path(directory).resolve()
+
     if not diff_text:
-        repo_dir = Path(directory).resolve()
+        if not repo_dir.exists():
+            return f"Error: Directory does not exist: '{directory}' (resolved: {repo_dir})"
+        if not repo_dir.is_dir():
+            return f"Error: Path is not a directory: '{directory}'"
+
         try:
             res = subprocess.run(
                 ["git", "diff", "HEAD"],
@@ -455,6 +527,15 @@ def typesafe_audit_diff(
                 text=True,
                 check=False,
             )
+            if res.returncode != 0:
+                stderr = res.stderr.strip()
+                if "not a git repository" in stderr.lower():
+                    return (
+                        f"⚠️ Directory `{repo_dir}` is not a git repository.\n"
+                        "To audit code modifications, run inside a git repository or supply the `git_diff` parameter explicitly."
+                    )
+                return f"Error running git in `{repo_dir}`: {stderr or f'exit code {res.returncode}'}"
+
             diff_text = res.stdout.strip()
             if not diff_text:
                 # Also check unstaged changes if HEAD diff is empty
@@ -466,14 +547,18 @@ def typesafe_audit_diff(
                     check=False,
                 )
                 diff_text = res_unstaged.stdout.strip()
+        except FileNotFoundError:
+            return "Error: `git` command not found in system PATH. Please ensure Git is installed or provide `git_diff` explicitly."
         except Exception as err:
-            return f"Error executing git diff in {repo_dir}: {err}"
+            return f"Error executing git diff in `{repo_dir}`: {err}"
 
     if not diff_text:
-        return "No git changes detected in the working tree to audit."
+        return f"ℹ️ No git changes detected in `{repo_dir}` to audit."
 
     # Filter out noisy lockfile and minified file diffs
     cleaned_diff = _clean_diff(diff_text)
+    if not cleaned_diff.strip():
+        return "ℹ️ Git diff contains only ignored lockfiles or binary assets. No source code modifications to audit."
 
     # Extract modified file paths from diff
     changed_files = re.findall(
@@ -486,7 +571,7 @@ def typesafe_audit_diff(
     truncated_diff = cleaned_diff[:12000]
 
     state = {
-        "task_description": task_description,
+        "task_description": clean_task,
         "changed_files": changed_files,
         "diff": truncated_diff,
     }
@@ -518,7 +603,7 @@ def typesafe_audit_diff(
             },
         )
     except Exception as err:
-        return f"TypeSafe API error during diff audit: {err}"
+        return _format_typesafe_error(err)
 
     scope = resp.answers["scope_alignment"].score
     touches_state_prob = resp.answers["touches_state"].noul
