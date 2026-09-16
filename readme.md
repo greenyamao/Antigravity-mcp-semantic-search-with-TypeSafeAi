@@ -75,31 +75,34 @@ Add the server to your global MCP configuration:
 ```
 *Note: Use forward slashes (`/`) in file paths. The `alwaysAllow` array allows seamless execution without manual approval prompts.*
 
-### 5. Add Skill & Rules to Your Project
-To make the AI assistant use this MCP server, copy the bundled skill and rules into your target project:
+### 5. Install Skill & Rules (Global)
+Install the bundled skill and rules globally so TypeSafe Code Guard automatically protects **all projects** opened in Antigravity IDE without copying files into every repository:
 
-1. **Copy the Skill**:
-   ```bash
-   # Windows (PowerShell)
-   Copy-Item -Recurse .agents\skills\typesafe-code-guard \path\to\your-project\.agents\skills\
+#### Windows (PowerShell)
+```powershell
+# Ensure target directories exist
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.gemini\config\skills", "$env:USERPROFILE\.gemini\config\rules" | Out-Null
 
-   # macOS / Linux
-   cp -r .agents/skills/typesafe-code-guard /path/to/your-project/.agents/skills/
-   ```
+# Install skill & rules
+Copy-Item -Recurse .agents\skills\typesafe-code-guard $env:USERPROFILE\.gemini\config\skills\
+Copy-Item AGENTS.md $env:USERPROFILE\.gemini\config\rules\typesafe.md
+```
 
-2. **Copy the Rules**:
-   Copy `AGENTS.md` to your target project root (or append its contents to your existing `AGENTS.md`):
-   ```bash
-   cp AGENTS.md /path/to/your-project/
-   ```
+#### macOS / Linux
+```bash
+# Ensure target directories exist
+mkdir -p ~/.gemini/config/skills ~/.gemini/config/rules
 
-*(Alternative: copy them to `$HOME/.gemini/config/skills/` and `$HOME/.gemini/config/rules/` to enable them globally for all projects).*
+# Install skill & rules
+cp -r .agents/skills/typesafe-code-guard ~/.gemini/config/skills/
+cp AGENTS.md ~/.gemini/config/rules/typesafe.md
+```
 
 ---
 
 ## Verification
 
-In your AI coding chat, prompt:
+Open **any project** in Antigravity IDE and prompt:
 > "Where is the user authentication or token verification implemented in this project?"
 
 The agent will invoke `typesafe_find_code` and return the exact file, lines, and snippet without reading full files into context.
